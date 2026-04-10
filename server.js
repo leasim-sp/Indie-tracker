@@ -8,7 +8,8 @@ const { execSync } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const REDIRECT_URI = process.env.REDIRECT_URI || 'http://localhost:3000/callback';
+// REDIRECT_URI is resolved at startup once LAN IP is known (see bottom of file)
+let REDIRECT_URI = process.env.REDIRECT_URI || `https://localhost:${process.env.PORT || 3000}/callback`;
 const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 
@@ -280,38 +281,87 @@ app.post('/api/playlists/:id/tracks', ensureAuth, async (req, res) => {
   }
 });
 
-// ── Start (HTTPS) ─────────────────────────────────────────────────────────────
+// ── Network & Certificate ─────────────────────────────────────────────────────
 
 const fs = require('fs');
+const os = require('os');
 const CERT_DIR = path.join(__dirname, '.certs');
-const KEY_FILE = path.join(CERT_DIR, 'localhost.key');
-const CERT_FILE = path.join(CERT_DIR, 'localhost.crt');
+const KEY_FILE  = path.join(CERT_DIR, 'server.key');
+const CERT_FILE = path.join(CERT_DIR, 'server.crt');
+const IP_FILE   = path.join(CERT_DIR, 'ip.txt');
 
-function getOrCreateCert() {
-  // Reuse existing cert so browsers only need to trust it once
-  if (fs.existsSync(KEY_FILE) && fs.existsSync(CERT_FILE)) {
+function getLanIP() {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const iface of ifaces) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return null;
+}
+
+function getOrCreateCert(lanIP) {
+  const savedIP   = fs.existsSync(IP_FILE)   ? fs.readFileSync(IP_FILE, 'utf8').trim() : null;
+  const certsExist = fs.existsSync(KEY_FILE) && fs.existsSync(CERT_FILE);
+
+  if (certsExist && savedIP === (lanIP || '')) {
     return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
   }
+
+  // First run or LAN IP changed → regenerate
   fs.mkdirSync(CERT_DIR, { recursive: true });
-  // Generate with openssl (available on macOS, Linux, Windows via Git Bash)
+  const altNames = lanIP
+    ? `DNS:localhost,IP:127.0.0.1,IP:${lanIP}`
+    : `DNS:localhost,IP:127.0.0.1`;
+
   execSync(
     `openssl req -x509 -newkey rsa:2048 -keyout "${KEY_FILE}" -out "${CERT_FILE}" ` +
     `-days 825 -nodes -subj "/CN=localhost" ` +
-    `-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`,
+    `-addext "subjectAltName=${altNames}"`,
     { stdio: 'ignore' }
   );
   fs.chmodSync(KEY_FILE, 0o600);
-  console.log(`\n   Certificado creado en ${CERT_DIR}`);
+  fs.writeFileSync(IP_FILE, lanIP || '');
+  console.log(`\n   Certificado generado (IPs: localhost${lanIP ? ', ' + lanIP : ''})`);
   return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
 }
 
-const tlsCreds = getOrCreateCert();
-const server = https.createServer(tlsCreds, app);
+// Route: download certificate for mobile installation
+app.get('/cert', (req, res) => {
+  res.setHeader('Content-Type', 'application/x-x509-ca-cert');
+  res.setHeader('Content-Disposition', 'attachment; filename="indie-tracker.crt"');
+  res.sendFile(CERT_FILE);
+});
 
-server.listen(PORT, () => {
-  console.log(`\n🎵  Indie Tracker → https://localhost:${PORT}`);
-  console.log(`\n   SAFARI: Para confiar en el certificado de forma permanente:`);
-  console.log(`   1. Abre https://localhost:${PORT} → haz clic en "Mostrar detalles" → "Visitar este sitio web"`);
-  console.log(`   2. (Opcional) Para no volver a ver el aviso: abre Llavero de acceso,`);
-  console.log(`      importa el archivo .certs/localhost.crt y márcalo como "Confiar siempre"\n`);
+// ── Start ─────────────────────────────────────────────────────────────────────
+
+const LAN_IP    = getLanIP();
+const tlsCreds  = getOrCreateCert(LAN_IP);
+const server    = https.createServer(tlsCreds, app);
+const localUrl  = `https://localhost:${PORT}`;
+const lanUrl    = LAN_IP ? `https://${LAN_IP}:${PORT}` : null;
+
+// If .env redirect URI still points to localhost but we have a LAN IP, upgrade it
+if (REDIRECT_URI.includes('localhost') && lanUrl) {
+  REDIRECT_URI = `${lanUrl}/callback`;
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🎵  Indie Tracker`);
+  console.log(`   Ordenador : ${localUrl}`);
+  if (lanUrl) console.log(`   Móvil/Red  : ${lanUrl}`);
+
+  if (lanUrl) {
+    console.log(`\n   ── Acceso desde móvil ──────────────────────────────────`);
+    console.log(`   1. Abre en el móvil: ${lanUrl}`);
+    console.log(`   2. Acepta el aviso del certificado`);
+    console.log(`      (Safari: "Mostrar detalles" → "Visitar este sitio web")`);
+    console.log(`      (Edge:   "Avanzado" → "Continuar de todos modos")`);
+    console.log(`   3. Para no repetirlo nunca más, instala el certificado:`);
+    console.log(`      Abre en el móvil → ${lanUrl}/cert`);
+    console.log(`      y sigue los pasos de instalación del sistema.`);
+    console.log(`\n   ── Spotify Developer Dashboard ─────────────────────────`);
+    console.log(`   Añade esta Redirect URI en tu app de Spotify:`);
+    console.log(`   → ${REDIRECT_URI}`);
+    console.log(`   (Settings → Edit → Redirect URIs)\n`);
+  }
 });
