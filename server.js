@@ -4,7 +4,7 @@ const axios = require('axios');
 const session = require('express-session');
 const path = require('path');
 const https = require('https');
-const selfsigned = require('selfsigned');
+const { execSync } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -282,16 +282,36 @@ app.post('/api/playlists/:id/tracks', ensureAuth, async (req, res) => {
 
 // ── Start (HTTPS) ─────────────────────────────────────────────────────────────
 
-// Generate a self-signed certificate for localhost on first run
-const pems = selfsigned.generate(
-  [{ name: 'commonName', value: 'localhost' }],
-  { days: 365, algorithm: 'sha256' }
-);
+const fs = require('fs');
+const CERT_DIR = path.join(__dirname, '.certs');
+const KEY_FILE = path.join(CERT_DIR, 'localhost.key');
+const CERT_FILE = path.join(CERT_DIR, 'localhost.crt');
 
-const server = https.createServer({ key: pems.private, cert: pems.cert }, app);
+function getOrCreateCert() {
+  // Reuse existing cert so browsers only need to trust it once
+  if (fs.existsSync(KEY_FILE) && fs.existsSync(CERT_FILE)) {
+    return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
+  }
+  fs.mkdirSync(CERT_DIR, { recursive: true });
+  // Generate with openssl (available on macOS, Linux, Windows via Git Bash)
+  execSync(
+    `openssl req -x509 -newkey rsa:2048 -keyout "${KEY_FILE}" -out "${CERT_FILE}" ` +
+    `-days 825 -nodes -subj "/CN=localhost" ` +
+    `-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`,
+    { stdio: 'ignore' }
+  );
+  fs.chmodSync(KEY_FILE, 0o600);
+  console.log(`\n   Certificado creado en ${CERT_DIR}`);
+  return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
+}
+
+const tlsCreds = getOrCreateCert();
+const server = https.createServer(tlsCreds, app);
 
 server.listen(PORT, () => {
   console.log(`\n🎵  Indie Tracker → https://localhost:${PORT}`);
-  console.log(`   Si el navegador avisa del certificado, haz clic en`);
-  console.log(`   "Configuración avanzada" → "Acceder a localhost (no seguro)"\n`);
+  console.log(`\n   SAFARI: Para confiar en el certificado de forma permanente:`);
+  console.log(`   1. Abre https://localhost:${PORT} → haz clic en "Mostrar detalles" → "Visitar este sitio web"`);
+  console.log(`   2. (Opcional) Para no volver a ver el aviso: abre Llavero de acceso,`);
+  console.log(`      importa el archivo .certs/localhost.crt y márcalo como "Confiar siempre"\n`);
 });
