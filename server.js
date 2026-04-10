@@ -3,6 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const session = require('express-session');
 const path = require('path');
+const https = require('https');
+const selfsigned = require('selfsigned');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,7 +18,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'indie-tracker-secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+  cookie: { secure: true, httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }
 }));
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -278,8 +280,18 @@ app.post('/api/playlists/:id/tracks', ensureAuth, async (req, res) => {
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start (HTTPS) ─────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`\n🎵  Indie Tracker → http://localhost:${PORT}\n`);
+// Generate a self-signed certificate for localhost on first run
+const pems = selfsigned.generate(
+  [{ name: 'commonName', value: 'localhost' }],
+  { days: 365, algorithm: 'sha256' }
+);
+
+const server = https.createServer({ key: pems.private, cert: pems.cert }, app);
+
+server.listen(PORT, () => {
+  console.log(`\n🎵  Indie Tracker → https://localhost:${PORT}`);
+  console.log(`   Si el navegador avisa del certificado, haz clic en`);
+  console.log(`   "Configuración avanzada" → "Acceder a localhost (no seguro)"\n`);
 });
