@@ -12,15 +12,56 @@ function getOAuth2Client() {
 }
 
 /**
- * List all topic files in the configured Drive folder.
- * Returns array of { number, title, drive_file_id, modifiedTime }
+ * Recursively collect every non-folder file inside a Drive folder.
+ * Handles pagination and descends into subfolders in parallel.
+ * @param {object} drive  - googleapis drive v3 client
+ * @param {string} folderId
+ * @returns {Promise<Array<{id, name, mimeType, modifiedTime}>>}
+ */
+async function collectFiles(drive, folderId) {
+  const results = [];
+  let pageToken;
+
+  do {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'nextPageToken, files(id, name, modifiedTime, mimeType)',
+      pageSize: 1000,
+      ...(pageToken && { pageToken }),
+    });
+
+    pageToken = res.data.nextPageToken;
+    const items = res.data.files || [];
+
+    const subfolders = [];
+    for (const item of items) {
+      if (item.mimeType === 'application/vnd.google-apps.folder') {
+        subfolders.push(item);
+      } else {
+        results.push(item);
+      }
+    }
+
+    // Descend into all subfolders of this level in parallel
+    const nested = await Promise.all(subfolders.map(f => collectFiles(drive, f.id)));
+    for (const batch of nested) results.push(...batch);
+
+  } while (pageToken);
+
+  return results;
+}
+
+/**
+ * List all topic files inside the configured Drive folder (recursive).
+ * Searches 'OPE' and every subfolder inside it, regardless of depth.
+ * Returns array of { number, title, drive_file_id, modifiedTime, mimeType }
  */
 export async function listTopics() {
   const auth = getOAuth2Client();
   const drive = google.drive({ version: 'v3', auth });
   const folderName = process.env.GOOGLE_DRIVE_FOLDER_NAME || 'OPE';
 
-  // Find the OPE folder
+  // Locate the root OPE folder
   const folderRes = await drive.files.list({
     q: `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
     fields: 'files(id, name)',
@@ -30,31 +71,31 @@ export async function listTopics() {
   const folder = folderRes.data.files?.[0];
   if (!folder) throw new Error(`Carpeta "${folderName}" no encontrada en Drive`);
 
-  // List files matching TEMA_XX pattern
-  const filesRes = await drive.files.list({
-    q: `'${folder.id}' in parents and trashed = false`,
-    fields: 'files(id, name, modifiedTime, mimeType)',
-    pageSize: 200,
-  });
+  // Collect all files from OPE and every nested subfolder
+  const allFiles = await collectFiles(drive, folder.id);
 
-  const files = filesRes.data.files || [];
   const topics = [];
-
-  for (const file of files) {
+  for (const file of allFiles) {
     const match = file.name.match(/TEMA[_\s-]*(\d+)/i);
     if (match) {
-      const number = parseInt(match[1], 10);
       topics.push({
-        number,
-        title: file.name,
+        number:        parseInt(match[1], 10),
+        title:         file.name,
         drive_file_id: file.id,
-        modifiedTime: file.modifiedTime,
-        mimeType: file.mimeType,
+        modifiedTime:  file.modifiedTime,
+        mimeType:      file.mimeType,
       });
     }
   }
 
-  return topics.sort((a, b) => a.number - b.number);
+  // If the same topic number appears in multiple subfolders, keep the last
+  // one found (relies on natural Drive listing order, first wins via Map)
+  const byNumber = new Map();
+  for (const t of topics) {
+    if (!byNumber.has(t.number)) byNumber.set(t.number, t);
+  }
+
+  return [...byNumber.values()].sort((a, b) => a.number - b.number);
 }
 
 /**
