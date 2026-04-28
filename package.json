@@ -10,7 +10,8 @@
     "dev:client": "cd client && npm run dev",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
     "build": "cd client && npm run build",
-    "setup": "node server/db.js"
+    "setup": "node server/db.js",
+    "auth:google": "node scripts/auth-google.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
