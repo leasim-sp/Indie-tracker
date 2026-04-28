@@ -4,23 +4,18 @@ import db from '../db.js';
 
 const router = Router();
 
-// GET /api/drive/topics — list available topics from Drive
+// GET /api/drive/topics
 router.get('/topics', async (req, res) => {
   try {
     const topics = await listTopics();
 
-    // Sync topic list to DB
-    const upsert = db.prepare(`
-      INSERT INTO topics (number, title, drive_file_id)
-      VALUES (?, ?, ?)
-      ON CONFLICT(number) DO UPDATE SET
-        title = excluded.title,
-        drive_file_id = excluded.drive_file_id
-    `);
-    const syncAll = db.transaction(list => {
-      for (const t of list) upsert.run(t.number, t.title, t.drive_file_id);
-    });
-    syncAll(topics);
+    for (const t of topics) {
+      db.topics.upsert({
+        number:        t.number,
+        title:         t.title,
+        drive_file_id: t.drive_file_id,
+      });
+    }
 
     res.json({ topics });
   } catch (err) {

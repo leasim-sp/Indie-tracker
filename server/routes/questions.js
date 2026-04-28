@@ -7,103 +7,68 @@ import { searchNormativa, extractNormativaRefs, verifyNormativa } from '../servi
 
 const router = Router();
 
-/**
- * POST /api/questions/generate
- * Body: { topics: number[], count: number, reuseExisting?: boolean }
- */
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function rowFromGenerated(q, topicNum) {
+  return {
+    id:           uuidv4(),
+    topic_number: q.topic || topicNum,
+    question:     q.question,
+    option_a:     q.options?.A || '',
+    option_b:     q.options?.B || '',
+    option_c:     q.options?.C || '',
+    option_d:     q.options?.D || '',
+    correct:      q.correct,
+    explanation:  q.explanation  || '',
+    normativa:    q.normativa    || '',
+    difficulty:   q.difficulty   || 'media',
+    verified:     0,
+    flagged:      0,
+  };
+}
+
+async function driveTopicsOrEmpty() {
+  try { return await listTopics(); } catch { return []; }
+}
+
+// ─── POST /api/questions/generate ────────────────────────────────────────────
 router.post('/generate', async (req, res) => {
   const { topics, count = 20, reuseExisting = false } = req.body;
-
   if (!topics?.length) return res.status(400).json({ error: 'Se requiere al menos un tema' });
 
-  const questionsPerTopic = Math.ceil(count / topics.length);
-  const result = [];
+  const perTopic = Math.ceil(count / topics.length);
+  const result   = [];
 
   try {
-    // Try to get available Drive files
-    let driveTopics = [];
-    try {
-      driveTopics = await listTopics();
-    } catch {
-      // Drive not configured — generate without document content
-    }
+    const driveFiles = await driveTopicsOrEmpty();
 
     for (const topicNum of topics) {
       if (reuseExisting) {
-        // Pull cached questions from DB
-        const cached = db.prepare(`
-          SELECT * FROM questions WHERE topic_number = ? ORDER BY RANDOM() LIMIT ?
-        `).all(topicNum, questionsPerTopic);
-
-        if (cached.length >= questionsPerTopic) {
-          result.push(...cached);
-          continue;
-        }
+        const cached = db.questions.findByTopic(topicNum, perTopic);
+        if (cached.length >= perTopic) { result.push(...cached); continue; }
       }
 
-      // Find Drive file for this topic
-      const driveFile = driveTopics.find(t => t.number === topicNum);
+      const driveFile = driveFiles.find(t => t.number === topicNum);
       let topicContent = '';
-
       if (driveFile) {
         topicContent = await getTopicContent(topicNum, driveFile.drive_file_id, driveFile.mimeType);
       }
 
-      // Extract normativa refs and search Tavily
       let normativaContext = '';
       if (topicContent) {
         const refs = extractNormativaRefs(topicContent);
-        if (refs.length) {
-          const query = `${refs.join(', ')} farmacia hospitalaria`;
-          normativaContext = await searchNormativa(query);
-        }
+        if (refs.length) normativaContext = await searchNormativa(`${refs.join(', ')} farmacia hospitalaria`);
       }
 
-      // Generate via Claude
-      const generated = await generateQuestions(topicContent, topicNum, questionsPerTopic, normativaContext);
+      const generated = await generateQuestions(topicContent, topicNum, perTopic, normativaContext);
 
-      // Persist to DB
-      const insert = db.prepare(`
-        INSERT OR IGNORE INTO questions
-          (id, topic_number, question, option_a, option_b, option_c, option_d,
-           correct, explanation, normativa, difficulty)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertAll = db.transaction(questions => {
-        for (const q of questions) {
-          const id = uuidv4();
-          insert.run(
-            id,
-            q.topic || topicNum,
-            q.question,
-            q.options?.A || '',
-            q.options?.B || '',
-            q.options?.C || '',
-            q.options?.D || '',
-            q.correct,
-            q.explanation || '',
-            q.normativa || '',
-            q.difficulty || 'media',
-          );
-          result.push({
-            id,
-            topic_number: q.topic || topicNum,
-            question: q.question,
-            option_a: q.options?.A || '',
-            option_b: q.options?.B || '',
-            option_c: q.options?.C || '',
-            option_d: q.options?.D || '',
-            correct: q.correct,
-            explanation: q.explanation || '',
-            normativa: q.normativa || '',
-            difficulty: q.difficulty || 'media',
-          });
-        }
-      });
-      insertAll(generated);
+      for (const q of generated) {
+        const row = rowFromGenerated(q, topicNum);
+        db.questions.insert(row);
+        result.push(row);
+      }
     }
 
-    // Trim to requested count
     res.json({ questions: result.slice(0, count) });
   } catch (err) {
     console.error('Generate error:', err);
@@ -111,105 +76,61 @@ router.post('/generate', async (req, res) => {
   }
 });
 
-/**
- * POST /api/questions/generate-review
- * Body: { questionIds: string[], topicNumber: number, extraCount?: number }
- */
+// ─── POST /api/questions/generate-review ─────────────────────────────────────
 router.post('/generate-review', async (req, res) => {
   const { questionIds, topicNumber, extraCount = 4 } = req.body;
 
   try {
-    const failed = questionIds.map(id =>
-      db.prepare('SELECT * FROM questions WHERE id = ?').get(id)
-    ).filter(Boolean);
+    const failed = questionIds.map(id => db.questions.findById(id)).filter(Boolean);
 
-    let driveTopics = [];
-    try { driveTopics = await listTopics(); } catch { }
-
-    const driveFile = driveTopics.find(t => t.number === topicNumber);
-    let topicContent = '';
+    const driveFiles  = await driveTopicsOrEmpty();
+    const driveFile   = driveFiles.find(t => t.number === topicNumber);
+    let topicContent  = '';
     if (driveFile) {
       topicContent = await getTopicContent(topicNumber, driveFile.drive_file_id, driveFile.mimeType);
     }
 
     const extra = await generateReviewQuestions(topicContent, topicNumber, failed, extraCount);
+    const newRows = extra.map(q => {
+      const row = rowFromGenerated(q, topicNumber);
+      db.questions.insert(row);
+      return row;
+    });
 
-    const insert = db.prepare(`
-      INSERT OR IGNORE INTO questions
-        (id, topic_number, question, option_a, option_b, option_c, option_d,
-         correct, explanation, normativa, difficulty)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const newQuestions = [];
-    db.transaction(() => {
-      for (const q of extra) {
-        const id = uuidv4();
-        insert.run(
-          id, q.topic || topicNumber,
-          q.question,
-          q.options?.A || '', q.options?.B || '', q.options?.C || '', q.options?.D || '',
-          q.correct, q.explanation || '', q.normativa || '', q.difficulty || 'media',
-        );
-        newQuestions.push({
-          id, topic_number: q.topic || topicNumber,
-          question: q.question,
-          option_a: q.options?.A || '', option_b: q.options?.B || '',
-          option_c: q.options?.C || '', option_d: q.options?.D || '',
-          correct: q.correct, explanation: q.explanation || '',
-          normativa: q.normativa || '', difficulty: q.difficulty || 'media',
-        });
-      }
-    })();
-
-    res.json({ questions: [...failed, ...newQuestions] });
+    res.json({ questions: [...failed, ...newRows] });
   } catch (err) {
     console.error('Generate-review error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/questions/verify
- * Body: { questionId: string }
- */
+// ─── POST /api/questions/verify ──────────────────────────────────────────────
 router.post('/verify', async (req, res) => {
-  const { questionId } = req.body;
-  const question = db.prepare('SELECT * FROM questions WHERE id = ?').get(questionId);
+  const question = db.questions.findById(req.body.questionId);
   if (!question) return res.status(404).json({ error: 'Pregunta no encontrada' });
 
   try {
     const normativaContext = await verifyNormativa(question.normativa);
     const result = await verifyQuestion(question, normativaContext);
 
-    if (!result.valid) {
-      db.prepare('UPDATE questions SET flagged = 1 WHERE id = ?').run(questionId);
-    } else {
-      db.prepare('UPDATE questions SET verified = 1 WHERE id = ?').run(questionId);
-    }
+    if (result.valid) db.questions.updateVerified(question.id, true);
+    else              db.questions.updateFlag(question.id, true);
 
-    res.json({ ...result, questionId });
+    res.json({ ...result, questionId: question.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/questions/flag
- * Body: { questionId: string }
- */
+// ─── POST /api/questions/flag ─────────────────────────────────────────────────
 router.post('/flag', (req, res) => {
-  const { questionId } = req.body;
-  db.prepare('UPDATE questions SET flagged = 1 WHERE id = ?').run(questionId);
+  db.questions.updateFlag(req.body.questionId, true);
   res.json({ ok: true });
 });
 
-/**
- * GET /api/questions/flagged
- */
+// ─── GET /api/questions/flagged ───────────────────────────────────────────────
 router.get('/flagged', (req, res) => {
-  const questions = db.prepare('SELECT * FROM questions WHERE flagged = 1').all();
-  res.json({ questions });
+  res.json({ questions: db.questions.allFlagged() });
 });
 
 export default router;

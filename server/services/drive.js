@@ -65,11 +65,8 @@ export async function listTopics() {
  * @returns {Promise<string>}
  */
 export async function getTopicContent(topicNumber, driveFileId, mimeType) {
-  // Check cache
-  const cached = db.prepare(
-    `SELECT content_cache, cache_updated_at FROM topics WHERE number = ?`
-  ).get(topicNumber);
-
+  // Check cache (24 h TTL)
+  const cached = db.topics.findByNumber(topicNumber);
   if (cached?.content_cache && cached.cache_updated_at) {
     const age = Date.now() - new Date(cached.cache_updated_at).getTime();
     if (age < 24 * 60 * 60 * 1000) return cached.content_cache;
@@ -81,40 +78,35 @@ export async function getTopicContent(topicNumber, driveFileId, mimeType) {
   let content = '';
 
   if (mimeType === 'application/vnd.google-apps.document') {
-    // Google Doc → export as plain text
     const res = await drive.files.export(
       { fileId: driveFileId, mimeType: 'text/plain' },
-      { responseType: 'text' }
+      { responseType: 'text' },
     );
     content = res.data;
   } else if (
     mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
   ) {
-    // .docx → mammoth
     const res = await drive.files.get(
       { fileId: driveFileId, alt: 'media' },
-      { responseType: 'arraybuffer' }
+      { responseType: 'arraybuffer' },
     );
     const result = await mammoth.extractRawText({ buffer: Buffer.from(res.data) });
     content = result.value;
   } else {
-    // Plain text or other
     const res = await drive.files.get(
       { fileId: driveFileId, alt: 'media' },
-      { responseType: 'text' }
+      { responseType: 'text' },
     );
     content = res.data;
   }
 
-  // Update cache
-  db.prepare(`
-    INSERT INTO topics (number, drive_file_id, content_cache, cache_updated_at)
-    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(number) DO UPDATE SET
-      drive_file_id = excluded.drive_file_id,
-      content_cache = excluded.content_cache,
-      cache_updated_at = excluded.cache_updated_at
-  `).run(topicNumber, driveFileId, content);
+  // Persist to cache
+  db.topics.upsert({
+    number:           topicNumber,
+    drive_file_id:    driveFileId,
+    content_cache:    content,
+    cache_updated_at: new Date().toISOString(),
+  });
 
   return content;
 }
